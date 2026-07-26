@@ -1,0 +1,10 @@
+# Vector database
+chroma_db/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Documents
+docs/
