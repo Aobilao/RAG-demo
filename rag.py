@@ -13,6 +13,7 @@ from chromadb.api.types import Metadata, PyEmbedding, Where
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from commands import Session, handle_command
+from reranker import load_reranker, rerank_scores
 
 BOLD = "\033[1m"
 CYAN = "\033[36m"
@@ -29,8 +30,10 @@ CHROMA_PATH = "chroma_db"
 COLLECTION_NAME = "documents"
 BATCH_SIZE = 32
 RRF_K = 60
+RERANK_K = 30
 
 SCORE_LABELS = {"dense": "Similarity", "bm25": "BM25", "hybrid": "RRF"}
+RERANK_LABEL = "Rerank"
 
 
 def sanitize(s: str) -> str:
@@ -266,6 +269,33 @@ def hybrid_retrieve(
     ]
 
 
+def to_triples(
+    corpus_index: CorpusIndex, results: list[tuple[str, float]]
+) -> list[tuple[str, float, Metadata]]:
+    return [
+        (corpus_index.by_id[doc_id][0], score, corpus_index.by_id[doc_id][1])
+        for doc_id, score in results
+    ]
+
+
+def apply_rerank(
+    query: str,
+    candidates: list[tuple[str, float, Metadata]],
+    top_n: int,
+) -> list[tuple[str, float, Metadata]]:
+    reranker = load_reranker()
+    if reranker is None:
+        print(f"{YELLOW}Falling back to first-stage ranking.{RESET}")
+        return candidates[:top_n]
+
+    scores = rerank_scores(reranker, query, [chunk for chunk, _, _ in candidates])
+    reranked = [
+        (chunk, score, meta) for (chunk, _, meta), score in zip(candidates, scores)
+    ]
+    reranked.sort(key=lambda triple: triple[1], reverse=True)
+    return reranked[:top_n]
+
+
 def retrieve(
     collection: chromadb.Collection,
     corpus_index: CorpusIndex,
@@ -273,18 +303,25 @@ def retrieve(
     top_n: int = 3,
     sources: list[str] | None = None,
     mode: str = "hybrid",
+    rerank: bool = False,
+    rerank_k: int = RERANK_K,
 ) -> list[tuple[str, float, Metadata]]:
-    if mode == "dense":
-        results = dense_search(collection, query, top_n, sources)
-    elif mode == "bm25":
-        results = bm25_search(corpus_index, query, top_n, sources)
-    else:
-        return hybrid_retrieve(collection, corpus_index, query, top_n, sources)
+    fetch_n = max(rerank_k, top_n) if rerank else top_n
 
-    return [
-        (corpus_index.by_id[doc_id][0], score, corpus_index.by_id[doc_id][1])
-        for doc_id, score in results
-    ]
+    if mode == "dense":
+        candidates = to_triples(
+            corpus_index, dense_search(collection, query, fetch_n, sources)
+        )
+    elif mode == "bm25":
+        candidates = to_triples(
+            corpus_index, bm25_search(corpus_index, query, fetch_n, sources)
+        )
+    else:
+        candidates = hybrid_retrieve(collection, corpus_index, query, fetch_n, sources)
+
+    if rerank and candidates:
+        return apply_rerank(query, candidates, top_n)
+    return candidates[:top_n]
 
 
 def build_prompt(retrieved: list[tuple[str, float, Metadata]]) -> str:
@@ -364,16 +401,20 @@ def main() -> None:
             session.top_n,
             session.sources,
             session.mode,
+            session.rerank,
+            session.rerank_k,
         )
         if not retrieved_knowledge:
             print("No matching results found.")
             continue
 
-        print(f"\n{CYAN}Retrieved knowledge ({session.mode}):{RESET}")
+        stage = f"{session.mode} + rerank" if session.rerank else session.mode
+        label = RERANK_LABEL if session.rerank else SCORE_LABELS[session.mode]
+        print(f"\n{CYAN}Retrieved knowledge ({stage}):{RESET}")
         for i, (chunk, score, meta) in enumerate(retrieved_knowledge, start=1):
             location = f"{meta['source']}, p. {meta['pages']}"
             print(
-                f"{YELLOW} - [{i}] ({SCORE_LABELS[session.mode]}: {score:.3f}) [{location}]{RESET}\n{chunk}\n"
+                f"{YELLOW} - [{i}] ({label}: {score:.3f}) [{location}]{RESET}\n{chunk}\n"
             )
 
         stream = ollama.chat(
