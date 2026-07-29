@@ -1,19 +1,24 @@
+from __future__ import annotations
+
 import glob
 import hashlib
 import os
 import re
 import readline  # noqa: F401  # pyright: ignore[reportUnusedImport]
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import bm25s
 import chromadb
 import ollama
-import pymupdf
 from chromadb.api.types import Metadata, PyEmbedding, Where
-from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from commands import Session, handle_command
+from extractor import EXTRACTOR_VERSION, extract_blocks
 from reranker import load_reranker, rerank_scores
+
+if TYPE_CHECKING:
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 BOLD = "\033[1m"
 CYAN = "\033[36m"
@@ -26,14 +31,30 @@ EMBEDDING_MODEL = "bge-m3"
 LANGUAGE_MODEL = "qwen3.5:4b"
 
 PDF_PATH = "docs"
+PAGE_SEPARATOR = "\n\n"
 CHROMA_PATH = "chroma_db"
 COLLECTION_NAME = "documents"
 BATCH_SIZE = 32
 RRF_K = 60
 RERANK_K = 30
+CHUNK_SIZE = 512
+CHUNK_OVERLAP = 50
 
 SCORE_LABELS = {"dense": "Similarity", "bm25": "BM25", "hybrid": "RRF"}
 RERANK_LABEL = "Rerank"
+
+_splitter: RecursiveCharacterTextSplitter | None = None
+
+
+def get_splitter() -> RecursiveCharacterTextSplitter:
+    global _splitter
+    if _splitter is None:
+        from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+        _splitter = RecursiveCharacterTextSplitter(
+            chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP
+        )
+    return _splitter
 
 
 def sanitize(s: str) -> str:
@@ -42,7 +63,8 @@ def sanitize(s: str) -> str:
 
 def file_hash(path: str) -> str:
     with open(path, "rb") as file:
-        return hashlib.blake2b(file.read()).hexdigest()
+        digest = hashlib.blake2b(file.read()).hexdigest()
+    return f"{EXTRACTOR_VERSION}:{digest}"
 
 
 def embed(texts: list[str] | str) -> list[PyEmbedding]:
@@ -53,52 +75,47 @@ def format_pages(pages: list[int]) -> str:
     return ", ".join(str(p) for p in pages)
 
 
-def extract_pages(path: str) -> list[tuple[int, str]]:
-    doc = pymupdf.open(path)
-    return [
-        (page_num, page.get_text())
-        for page_num, page in enumerate(doc.pages(), start=1)
-    ]
-
-
 def find_pages(
-    chunk: str, full_text: str, page_offsets: list[tuple[int, int, int]]
+    chunk: str, full_text: str, page_offsets: list[tuple[int, int, list[int]]]
 ) -> list[int]:
     idx = full_text.find(chunk)
     if idx == -1:
         return []
     chunk_start, chunk_end = idx, idx + len(chunk)
-    return [
-        page_num
-        for start, end, page_num in page_offsets
-        if start < chunk_end and end > chunk_start
-    ]
+    return sorted(
+        {
+            page_num
+            for start, end, pages in page_offsets
+            if start < chunk_end and end > chunk_start
+            for page_num in pages
+        }
+    )
 
 
-def chunk_pdf(
-    path: str, splitter: RecursiveCharacterTextSplitter
-) -> list[tuple[str, list[int]]]:
-    pages = extract_pages(path)
+def chunk_pdf(path: str) -> list[tuple[str, list[int]]]:
+    blocks = extract_blocks(path)
     full_text = ""
-    page_offsets: list[tuple[int, int, int]] = []
+    page_offsets: list[tuple[int, int, list[int]]] = []
 
-    for page_num, page_text in pages:
+    for pages, block_text in blocks:
         start = len(full_text)
-        full_text += page_text
-        page_offsets.append((start, len(full_text), page_num))
+        full_text += block_text
+        page_offsets.append((start, len(full_text), pages))
+        full_text += PAGE_SEPARATOR
 
-    chunks = splitter.split_text(full_text)
+    chunks = get_splitter().split_text(full_text)
     return [(chunk, find_pages(chunk, full_text, page_offsets)) for chunk in chunks]
 
 
 def already_indexed(
-    collection: chromadb.Collection, source: str, current_hash: str
+    collection: chromadb.Collection,
+    source: str,
+    current_hash: str,
+    file_hashes: dict[str, str],
 ) -> bool:
-    result = collection.get(where={"source": source}, limit=1)
-    metadatas = result["metadatas"]
-    if not result["ids"] or not metadatas:
+    stored_hash = file_hashes.get(source)
+    if stored_hash is None:
         return False
-    stored_hash = metadatas[0].get("file_hash", "")
     if stored_hash != current_hash:
         collection.delete(where={"source": source})
         print(f"{source}: file changed, re-indexing")
@@ -107,20 +124,19 @@ def already_indexed(
 
 
 def ingest_pdf(
-    collection: chromadb.Collection,
-    path: str,
-    splitter: RecursiveCharacterTextSplitter,
-) -> None:
+    collection: chromadb.Collection, path: str, file_hashes: dict[str, str]
+) -> bool:
+    """Ingest a PDF, returning False only when it was already up to date."""
     source = os.path.basename(path)
     current_hash = file_hash(path)
-    if already_indexed(collection, source, current_hash):
+    if already_indexed(collection, source, current_hash, file_hashes):
         print(f"{source}: already indexed, skipping")
-        return
+        return False
 
-    pieces = chunk_pdf(path, splitter)
+    pieces = chunk_pdf(path)
     if not pieces:
         print(f"{source}: no text extracted, skipping")
-        return
+        return True
 
     ids = [f"{source}::{i}" for i in range(len(pieces))]
     docs = [sanitize(chunk) for chunk, _ in pieces]
@@ -138,26 +154,27 @@ def ingest_pdf(
             metadatas=metas[start:end],
         )
         print(f"{source}: indexed {min(end, len(docs))}/{len(docs)} chunks")
+    return True
 
 
 def ingest_directory(
-    collection: chromadb.Collection,
-    pdf_dir: str,
-    splitter: RecursiveCharacterTextSplitter,
-) -> None:
+    collection: chromadb.Collection, pdf_dir: str, file_hashes: dict[str, str]
+) -> bool:
+    """Sync the collection with pdf_dir, returning True if anything changed."""
     paths = sorted(glob.glob(os.path.join(pdf_dir, "*.pdf")))
     current_sources = {os.path.basename(p) for p in paths}
 
-    stored_metas = collection.get(include=["metadatas"])["metadatas"] or []
-    indexed_sources = {str(meta["source"]) for meta in stored_metas}
-    for source in indexed_sources - current_sources:
+    changed = False
+    for source in file_hashes.keys() - current_sources:
         collection.delete(where={"source": source})
         print(f"{source}: removed from database (file deleted)")
+        changed = True
 
     if not paths:
         print(f"No PDFs found in {pdf_dir}/")
     for path in paths:
-        ingest_pdf(collection, path, splitter)
+        changed |= ingest_pdf(collection, path, file_hashes)
+    return changed
 
 
 def tokenize(text: str) -> list[str]:
@@ -169,6 +186,7 @@ class CorpusIndex:
     bm25: bm25s.BM25 | None
     ids: list[str]
     by_id: dict[str, tuple[str, Metadata]]
+    file_hashes: dict[str, str]
 
 
 def build_corpus_index(collection: chromadb.Collection) -> CorpusIndex:
@@ -181,7 +199,10 @@ def build_corpus_index(collection: chromadb.Collection) -> CorpusIndex:
         bm25 = bm25s.BM25()
         bm25.index([tokenize(doc) for doc in docs], show_progress=False)
     by_id = {doc_id: (doc, meta) for doc_id, doc, meta in zip(ids, docs, metas)}
-    return CorpusIndex(bm25=bm25, ids=ids, by_id=by_id)
+    file_hashes = {
+        str(meta["source"]): str(meta.get("file_hash", "")) for meta in metas
+    }
+    return CorpusIndex(bm25=bm25, ids=ids, by_id=by_id, file_hashes=file_hashes)
 
 
 def dense_search(
@@ -343,16 +364,12 @@ def build_prompt(retrieved: list[tuple[str, float, Metadata]]) -> str:
     )
 
 
-def reindex(
-    collection: chromadb.Collection,
-    source: str,
-    splitter: RecursiveCharacterTextSplitter,
-) -> CorpusIndex:
+def reindex(collection: chromadb.Collection, source: str) -> CorpusIndex:
     path = os.path.join(PDF_PATH, source)
     collection.delete(where={"source": source})
     print(f"Deleted {source}, re-ingesting...")
     if os.path.exists(path):
-        ingest_pdf(collection, path, splitter)
+        ingest_pdf(collection, path, {})
     else:
         print(f"{source} not found in {PDF_PATH}/")
     return build_corpus_index(collection)
@@ -367,15 +384,17 @@ def main() -> None:
         configuration={"hnsw": {"space": "cosine"}},
     )
 
-    splitter = RecursiveCharacterTextSplitter(chunk_size=512, chunk_overlap=50)
-    ingest_directory(collection, PDF_PATH, splitter)
     corpus_index = build_corpus_index(collection)
+    if ingest_directory(collection, PDF_PATH, corpus_index.file_hashes):
+        corpus_index = build_corpus_index(collection)
 
     session = Session()
     while True:
+        stage = f"{session.mode} + rerank" if session.rerank else session.mode
+        label = RERANK_LABEL if session.rerank else SCORE_LABELS[session.mode]
         try:
             input_query = input(
-                f"\n{MAGENTA}Ask a question (or 'q' to quit):{RESET} "
+                f"\n{MAGENTA}({stage}) Ask a question (or 'q' to quit):{RESET} "
             ).strip()
         except (EOFError, KeyboardInterrupt):
             break
@@ -386,7 +405,7 @@ def main() -> None:
 
         if handle_command(input_query, session):
             if session.pending_reindex:
-                corpus_index = reindex(collection, session.pending_reindex, splitter)
+                corpus_index = reindex(collection, session.pending_reindex)
                 session.pending_reindex = None
             continue
 
@@ -408,9 +427,7 @@ def main() -> None:
             print("No matching results found.")
             continue
 
-        stage = f"{session.mode} + rerank" if session.rerank else session.mode
-        label = RERANK_LABEL if session.rerank else SCORE_LABELS[session.mode]
-        print(f"\n{CYAN}Retrieved knowledge ({stage}):{RESET}")
+        print(f"\n{CYAN}Retrieved knowledge:{RESET}")
         for i, (chunk, score, meta) in enumerate(retrieved_knowledge, start=1):
             location = f"{meta['source']}, p. {meta['pages']}"
             print(

@@ -1,13 +1,13 @@
 import os
 from dataclasses import dataclass
 
-# Xet transfers stall on this machine; plain HTTP downloads work reliably.
 os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 
-import numpy as np  # noqa: E402
-import onnxruntime as ort  # noqa: E402
-from huggingface_hub import hf_hub_download  # noqa: E402
-from tokenizers import Tokenizer  # noqa: E402
+import numpy as np
+import onnxruntime as ort
+from huggingface_hub import hf_hub_download
+from huggingface_hub.errors import LocalEntryNotFoundError
+from tokenizers import Tokenizer
 
 RERANKER_REPO = "BAAI/bge-reranker-base"
 RERANKER_ONNX = "onnx/model.onnx"
@@ -28,6 +28,13 @@ _reranker: Reranker | None = None
 _load_failed = False
 
 
+def _download(filename: str) -> str:
+    try:
+        return hf_hub_download(RERANKER_REPO, filename, local_files_only=True)
+    except LocalEntryNotFoundError:
+        return hf_hub_download(RERANKER_REPO, filename)
+
+
 def load_reranker() -> Reranker | None:
     global _reranker, _load_failed
     if _reranker is not None or _load_failed:
@@ -35,8 +42,8 @@ def load_reranker() -> Reranker | None:
 
     try:
         print(f"Loading reranker {RERANKER_REPO}...")
-        tokenizer_path = hf_hub_download(RERANKER_REPO, "tokenizer.json")
-        model_path = hf_hub_download(RERANKER_REPO, RERANKER_ONNX)
+        tokenizer_path = _download("tokenizer.json")
+        model_path = _download(RERANKER_ONNX)
 
         tokenizer = Tokenizer.from_file(tokenizer_path)
         tokenizer.enable_truncation(
@@ -44,9 +51,7 @@ def load_reranker() -> Reranker | None:
         )
         tokenizer.enable_padding(pad_id=PAD_TOKEN_ID, pad_token=PAD_TOKEN)
 
-        session = ort.InferenceSession(
-            model_path, providers=["CPUExecutionProvider"]
-        )
+        session = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
         _reranker = Reranker(
             session=session,
             tokenizer=tokenizer,
@@ -71,9 +76,7 @@ def rerank_scores(reranker: Reranker, query: str, docs: list[str]) -> list[float
         encodings = reranker.tokenizer.encode_batch([(query, doc) for doc in batch])
 
         input_ids = np.array([e.ids for e in encodings], dtype=np.int64)
-        attention_mask = np.array(
-            [e.attention_mask for e in encodings], dtype=np.int64
-        )
+        attention_mask = np.array([e.attention_mask for e in encodings], dtype=np.int64)
         inputs = {"input_ids": input_ids, "attention_mask": attention_mask}
         if "token_type_ids" in reranker.input_names:
             inputs["token_type_ids"] = np.zeros_like(input_ids)
