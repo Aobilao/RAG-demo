@@ -6,16 +6,17 @@ import os
 import re
 import readline  # noqa: F401  # pyright: ignore[reportUnusedImport]
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Protocol
 
 import bm25s
 import chromadb
 import ollama
 from chromadb.api.types import Metadata, PyEmbedding, Where
 
-from commands import Session, handle_command
-from extractor import EXTRACTOR_VERSION, extract_blocks
-from reranker import load_reranker, rerank_scores
+from . import images
+from .commands import Session, handle_command
+from .extractor import EXTRACTOR_VERSION, extract_blocks
+from .reranker import load_reranker, rerank_scores
 
 if TYPE_CHECKING:
     from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -34,6 +35,9 @@ PDF_PATH = "docs"
 PAGE_SEPARATOR = "\n\n"
 CHROMA_PATH = "chroma_db"
 COLLECTION_NAME = "documents"
+INDEXED_PREFIX = "indexed:"
+SCHEMA_KEY = "rag:schema"
+SCHEMA_VERSION = "1"
 BATCH_SIZE = 32
 RRF_K = 60
 RERANK_K = 30
@@ -107,42 +111,64 @@ def chunk_pdf(path: str) -> list[tuple[str, list[int]]]:
     return [(chunk, find_pages(chunk, full_text, page_offsets)) for chunk in chunks]
 
 
-def already_indexed(
-    collection: chromadb.Collection,
-    source: str,
-    current_hash: str,
-    file_hashes: dict[str, str],
-) -> bool:
-    stored_hash = file_hashes.get(source)
-    if stored_hash is None:
-        return False
-    if stored_hash != current_hash:
-        collection.delete(where={"source": source})
-        print(f"{source}: file changed, re-indexing")
-        return False
-    return True
+class MetadataStore(Protocol):
+    @property
+    def metadata(self) -> dict[str, Any] | None: ...
+
+    def modify(self, *, metadata: dict[str, Any]) -> None: ...
+
+
+def indexed_hashes(collection: MetadataStore) -> dict[str, str]:
+    return {
+        key.removeprefix(INDEXED_PREFIX): str(value)
+        for key, value in (collection.metadata or {}).items()
+        if key.startswith(INDEXED_PREFIX)
+    }
+
+
+def write_metadata(collection: MetadataStore, metadata: dict[str, Any]) -> None:
+    collection.modify(metadata={SCHEMA_KEY: SCHEMA_VERSION, **metadata})
+
+
+def mark_indexed(collection: MetadataStore, source: str, digest: str) -> None:
+    metadata = dict(collection.metadata or {})
+    metadata[INDEXED_PREFIX + source] = digest
+    write_metadata(collection, metadata)
+
+
+def unmark_indexed(collection: MetadataStore, source: str) -> None:
+    metadata = dict(collection.metadata or {})
+    if metadata.pop(INDEXED_PREFIX + source, None) is not None:
+        write_metadata(collection, metadata)
 
 
 def ingest_pdf(
     collection: chromadb.Collection, path: str, file_hashes: dict[str, str]
 ) -> bool:
-    """Ingest a PDF, returning False only when it was already up to date."""
     source = os.path.basename(path)
     current_hash = file_hash(path)
-    if already_indexed(collection, source, current_hash, file_hashes):
+    stored_hash = file_hashes.get(source)
+
+    if stored_hash == current_hash:
         print(f"{source}: already indexed, skipping")
         return False
+    if stored_hash is not None:
+        collection.delete(where={"source": source})
+        print(f"{source}: file changed, re-indexing")
+    elif collection.get(where={"source": source}, limit=1)["ids"]:
+        collection.delete(where={"source": source})
+        print(f"{source}: previous indexing was interrupted, re-indexing")
 
     pieces = chunk_pdf(path)
     if not pieces:
         print(f"{source}: no text extracted, skipping")
+        mark_indexed(collection, source, current_hash)
         return True
 
     ids = [f"{source}::{i}" for i in range(len(pieces))]
     docs = [sanitize(chunk) for chunk, _ in pieces]
     metas: list[Metadata] = [
-        {"source": source, "pages": format_pages(pages), "file_hash": current_hash}
-        for _, pages in pieces
+        {"source": source, "pages": format_pages(pages)} for _, pages in pieces
     ]
 
     for start in range(0, len(docs), BATCH_SIZE):
@@ -154,19 +180,21 @@ def ingest_pdf(
             metadatas=metas[start:end],
         )
         print(f"{source}: indexed {min(end, len(docs))}/{len(docs)} chunks")
+
+    mark_indexed(collection, source, current_hash)
     return True
 
 
 def ingest_directory(
     collection: chromadb.Collection, pdf_dir: str, file_hashes: dict[str, str]
 ) -> bool:
-    """Sync the collection with pdf_dir, returning True if anything changed."""
     paths = sorted(glob.glob(os.path.join(pdf_dir, "*.pdf")))
     current_sources = {os.path.basename(p) for p in paths}
 
     changed = False
     for source in file_hashes.keys() - current_sources:
         collection.delete(where={"source": source})
+        unmark_indexed(collection, source)
         print(f"{source}: removed from database (file deleted)")
         changed = True
 
@@ -187,6 +215,7 @@ class CorpusIndex:
     ids: list[str]
     by_id: dict[str, tuple[str, Metadata]]
     file_hashes: dict[str, str]
+    sources: set[str]
 
 
 def build_corpus_index(collection: chromadb.Collection) -> CorpusIndex:
@@ -199,10 +228,20 @@ def build_corpus_index(collection: chromadb.Collection) -> CorpusIndex:
         bm25 = bm25s.BM25()
         bm25.index([tokenize(doc) for doc in docs], show_progress=False)
     by_id = {doc_id: (doc, meta) for doc_id, doc, meta in zip(ids, docs, metas)}
+
     file_hashes = {
-        str(meta["source"]): str(meta.get("file_hash", "")) for meta in metas
+        str(meta["source"]): str(meta["file_hash"])
+        for meta in metas
+        if meta.get("file_hash")
     }
-    return CorpusIndex(bm25=bm25, ids=ids, by_id=by_id, file_hashes=file_hashes)
+    file_hashes.update(indexed_hashes(collection))
+    return CorpusIndex(
+        bm25=bm25,
+        ids=ids,
+        by_id=by_id,
+        file_hashes=file_hashes,
+        sources={str(meta["source"]) for meta in metas},
+    )
 
 
 def dense_search(
@@ -364,15 +403,108 @@ def build_prompt(retrieved: list[tuple[str, float, Metadata]]) -> str:
     )
 
 
+def find_images(images_collection: chromadb.Collection, query: str) -> None:
+    if images_collection.count() == 0:
+        print("No images indexed. Add pictures to images/ and run /refresh=images.")
+        return
+    matches = images.search(images_collection, query)
+    if not matches:
+        print("No matching images found.")
+        return
+    print(f"\n{CYAN}Images matching '{query}':{RESET}")
+    for i, match in enumerate(matches, start=1):
+        print(
+            f"{YELLOW} - [{i}] ({match.score:.3f}) {match.source}{RESET}\n{match.caption}\n"
+        )
+
+
 def reindex(collection: chromadb.Collection, source: str) -> CorpusIndex:
     path = os.path.join(PDF_PATH, source)
     collection.delete(where={"source": source})
+    unmark_indexed(collection, source)
     print(f"Deleted {source}, re-ingesting...")
     if os.path.exists(path):
         ingest_pdf(collection, path, {})
     else:
         print(f"{source} not found in {PDF_PATH}/")
     return build_corpus_index(collection)
+
+
+def refresh_docs(
+    collection: chromadb.Collection, corpus_index: CorpusIndex
+) -> CorpusIndex:
+    if ingest_directory(collection, PDF_PATH, corpus_index.file_hashes):
+        return build_corpus_index(collection)
+    return corpus_index
+
+
+def apply_pending(
+    session: Session,
+    collection: chromadb.Collection,
+    images_collection: chromadb.Collection,
+    corpus_index: CorpusIndex,
+) -> CorpusIndex:
+    if session.pending_reindex:
+        corpus_index = reindex(collection, session.pending_reindex)
+        session.known_sources = corpus_index.sources
+        session.pending_reindex = None
+    if session.pending_image_query:
+        find_images(images_collection, session.pending_image_query)
+        session.pending_image_query = None
+    if session.pending_refresh == "docs":
+        corpus_index = refresh_docs(collection, corpus_index)
+        session.known_sources = corpus_index.sources
+        session.pending_refresh = None
+    elif session.pending_refresh == "images":
+        images.ingest_directory(images_collection, images.IMAGES_PATH)
+        session.pending_refresh = None
+    return corpus_index
+
+
+def answer_query(
+    collection: chromadb.Collection,
+    corpus_index: CorpusIndex,
+    session: Session,
+    query: str,
+) -> None:
+    if collection.count() == 0:
+        print("Database is empty. Add PDFs to docs/ and run /refresh=docs.")
+        return
+
+    retrieved_knowledge = retrieve(
+        collection,
+        corpus_index,
+        query,
+        session.top_n,
+        session.sources,
+        session.mode,
+        session.rerank,
+        session.rerank_k,
+    )
+    if not retrieved_knowledge:
+        print("No matching results found.")
+        return
+
+    label = RERANK_LABEL if session.rerank else SCORE_LABELS[session.mode]
+    print(f"\n{CYAN}Retrieved knowledge:{RESET}")
+    for i, (chunk, score, meta) in enumerate(retrieved_knowledge, start=1):
+        location = f"{meta['source']}, p. {meta['pages']}"
+        print(f"{YELLOW} - [{i}] ({label}: {score:.3f}) [{location}]{RESET}\n{chunk}\n")
+
+    stream = ollama.chat(
+        model=LANGUAGE_MODEL,
+        messages=[
+            {"role": "system", "content": build_prompt(retrieved_knowledge)},
+            {"role": "user", "content": sanitize(query)},
+        ],
+        stream=True,
+        think=False,
+        options={"temperature": session.temperature},
+    )
+    print(f"{BOLD}{GREEN}Chatbot response:{RESET}")
+    for chunk in stream:
+        print(chunk.message.content, end="", flush=True)
+    print()
 
 
 def main() -> None:
@@ -384,14 +516,15 @@ def main() -> None:
         configuration={"hnsw": {"space": "cosine"}},
     )
 
-    corpus_index = build_corpus_index(collection)
-    if ingest_directory(collection, PDF_PATH, corpus_index.file_hashes):
-        corpus_index = build_corpus_index(collection)
+    corpus_index = refresh_docs(collection, build_corpus_index(collection))
 
-    session = Session()
+    os.makedirs(images.IMAGES_PATH, exist_ok=True)
+    images_collection = images.open_collection()
+    images.ingest_directory(images_collection, images.IMAGES_PATH)
+
+    session = Session(known_sources=corpus_index.sources)
     while True:
         stage = f"{session.mode} + rerank" if session.rerank else session.mode
-        label = RERANK_LABEL if session.rerank else SCORE_LABELS[session.mode]
         try:
             input_query = input(
                 f"\n{MAGENTA}({stage}) Ask a question (or 'q' to quit):{RESET} "
@@ -404,53 +537,12 @@ def main() -> None:
             break
 
         if handle_command(input_query, session):
-            if session.pending_reindex:
-                corpus_index = reindex(collection, session.pending_reindex)
-                session.pending_reindex = None
-            continue
-
-        if collection.count() == 0:
-            print("Database is empty. Add PDFs to the docs/ directory.")
-            continue
-
-        retrieved_knowledge = retrieve(
-            collection,
-            corpus_index,
-            input_query,
-            session.top_n,
-            session.sources,
-            session.mode,
-            session.rerank,
-            session.rerank_k,
-        )
-        if not retrieved_knowledge:
-            print("No matching results found.")
-            continue
-
-        print(f"\n{CYAN}Retrieved knowledge:{RESET}")
-        for i, (chunk, score, meta) in enumerate(retrieved_knowledge, start=1):
-            location = f"{meta['source']}, p. {meta['pages']}"
-            print(
-                f"{YELLOW} - [{i}] ({label}: {score:.3f}) [{location}]{RESET}\n{chunk}\n"
+            corpus_index = apply_pending(
+                session, collection, images_collection, corpus_index
             )
+            continue
 
-        stream = ollama.chat(
-            model=LANGUAGE_MODEL,
-            messages=[
-                {
-                    "role": "system",
-                    "content": build_prompt(retrieved_knowledge),
-                },
-                {"role": "user", "content": sanitize(input_query)},
-            ],
-            stream=True,
-            think=False,
-            options={"temperature": session.temperature},
-        )
-        print(f"{BOLD}{GREEN}Chatbot response:{RESET}")
-        for chunk in stream:
-            print(chunk.message.content, end="", flush=True)
-        print()
+        answer_query(collection, corpus_index, session, input_query)
 
 
 if __name__ == "__main__":

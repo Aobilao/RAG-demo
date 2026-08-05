@@ -1,8 +1,9 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 MODES = ("dense", "bm25", "hybrid")
 TRUTHY = ("on", "true", "1", "yes")
 FALSY = ("off", "false", "0", "no")
+REFRESH_TARGETS = ("docs", "images")
 
 
 @dataclass
@@ -14,6 +15,9 @@ class Session:
     rerank: bool = False
     rerank_k: int = 30
     pending_reindex: str | None = None
+    pending_image_query: str | None = None
+    pending_refresh: str | None = None
+    known_sources: set[str] = field(default_factory=set)
 
 
 def set_top_n(session: Session, value: str) -> None:
@@ -75,8 +79,20 @@ def set_sources(session: Session, value: str) -> None:
         session.sources = None
         print("Retrieving from all sources")
         return
-    session.sources = [s.strip() for s in value.split(",")]
-    print(f"Retrieving from: {session.sources}")
+
+    requested = [s.strip() for s in value.split(",") if s.strip()]
+    if not requested:
+        print("Usage: /sources=<file1.pdf,file2.pdf> or /sources=all")
+        return
+
+    unknown = [s for s in requested if s not in session.known_sources]
+    if session.known_sources and unknown:
+        print(f"Unknown source(s): {', '.join(unknown)}")
+        print(f"Indexed sources: {', '.join(sorted(session.known_sources))}")
+        return
+
+    session.sources = requested
+    print(f"Retrieving from: {', '.join(requested)}")
 
 
 def set_pending_reindex(session: Session, value: str) -> None:
@@ -84,6 +100,21 @@ def set_pending_reindex(session: Session, value: str) -> None:
         print("Usage: /reindex=<filename.pdf>")
         return
     session.pending_reindex = value
+
+
+def set_pending_image_query(session: Session, value: str) -> None:
+    if not value:
+        print("Usage: /find=<mô tả ảnh cần tìm>")
+        return
+    session.pending_image_query = value
+
+
+def set_pending_refresh(session: Session, value: str) -> None:
+    target = value.lower()
+    if target not in REFRESH_TARGETS:
+        print(f"Usage: /refresh=<{'|'.join(REFRESH_TARGETS)}>")
+        return
+    session.pending_refresh = target
 
 
 def print_status(session: Session) -> None:
@@ -120,11 +151,15 @@ def handle_command(text: str, session: Session) -> bool:
         set_sources(session, value)
     elif name == "reindex":
         set_pending_reindex(session, value)
+    elif name == "find":
+        set_pending_image_query(session, value)
+    elif name == "refresh":
+        set_pending_refresh(session, value)
     elif name == "status":
         print_status(session)
     else:
         print(
             "Unknown command. Available: /top_n=, /temperature=, /mode=, "
-            "/rerank=, /rerank_k=, /sources=, /reindex=, /status"
+            "/rerank=, /rerank_k=, /sources=, /reindex=, /find=, /refresh=, /status"
         )
     return True

@@ -51,11 +51,13 @@ def load_reranker() -> Reranker | None:
         )
         tokenizer.enable_padding(pad_id=PAD_TOKEN_ID, pad_token=PAD_TOKEN)
 
-        session = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
+        inf_session = ort.InferenceSession(
+            model_path, providers=["CPUExecutionProvider"]
+        )
         _reranker = Reranker(
-            session=session,
+            session=inf_session,
             tokenizer=tokenizer,
-            input_names={i.name for i in session.get_inputs()},
+            input_names={i.name for i in inf_session.get_inputs()},
         )
     except Exception as exc:
         print(f"Reranker unavailable: {exc}")

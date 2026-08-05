@@ -1,0 +1,367 @@
+/* Critical apparatus.
+   The documents are scholarly editions, so the page borrows their conventions: a
+   reading column set in a serif, and citations in the left gutter aligned to the
+   line they support. Red belongs to citations and to nothing else — it is the one
+   thing on the page that carries the argument. */
+
+:root {
+  --paper:   #eef0ec;   /* archival card stock, cooler than book cream */
+  --card:    #f9faf7;
+  --ink:     #15191a;
+  --ink-mid: #4c5457;
+  --ink-low: #7d8688;
+  --rule:    #d5dad3;
+  --rule-sc: #bfc6bd;
+  --stamp:   #b3261e;   /* citations only */
+  --stamp-w: #f6e4e2;
+  --radius:  3px;       /* documents do not have rounded corners */
+
+  --serif: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, "Times New Roman", serif;
+  --sans:  system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --mono:  ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
+
+  --gutter: 234px;
+  --gap:    34px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --paper:   #121618;
+    --card:    #182022;
+    --ink:     #e6eae6;
+    --ink-mid: #a3adad;
+    --ink-low: #6f7a7a;
+    --rule:    #263032;
+    --rule-sc: #3a4649;
+    --stamp:   #e8776c;
+    --stamp-w: #35191a;
+  }
+}
+
+/* ── Base ─────────────────────────────────────────────────────
+   The `hidden` attribute is how the page keeps results out of the way until
+   there are results. It is applied by the browser as `display: none`, which any
+   author rule setting `display` outranks — and the results block is a grid. The
+   attribute has to win, or an empty answer and its rule show on first load. */
+* { box-sizing: border-box; }
+
+[hidden] { display: none !important; }
+
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font: 14px/1.5 var(--sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+:focus-visible { outline: 2px solid var(--stamp); outline-offset: 2px; }
+
+/* ── Running head ─────────────────────────────────────────── */
+.bar {
+  display: flex; align-items: center; gap: 18px;
+  padding: 0 26px; height: 50px;
+  border-bottom: 1px solid var(--rule);
+  background: var(--card);
+  position: sticky; top: 0; z-index: 30;
+}
+.bar-id { display: flex; align-items: baseline; gap: 9px; margin: 0; font-weight: 400; }
+.bar-glyph { color: var(--stamp); font: 17px/1 var(--serif); }
+.bar-name {
+  font: 500 11px/1 var(--sans);
+  letter-spacing: .13em; text-transform: uppercase;
+}
+
+.bar-state {
+  margin: 0 0 0 auto;
+  display: flex; align-items: center; gap: 8px;
+  font: 11px/1 var(--mono); color: var(--ink-mid);
+  letter-spacing: .02em;
+}
+.tick { width: 6px; height: 6px; background: var(--ink-low); flex: none; }
+.tick.on   { background: var(--stamp); }
+.tick.work { background: var(--ink-low); animation: tick .9s steps(2) infinite; }
+.tick.off  { background: transparent; box-shadow: inset 0 0 0 1px var(--ink-low); }
+@keyframes tick { 50% { opacity: .2; } }
+
+/* ── Controls ─────────────────────────────────────────────── */
+.act {
+  font: 500 12px/1 var(--sans);
+  letter-spacing: .04em;
+  padding: 7px 13px;
+  color: var(--ink-mid);
+  background: var(--card);
+  border: 1px solid var(--rule-sc);
+  border-radius: var(--radius);
+  cursor: pointer;
+  transition: color .12s, border-color .12s, background .12s;
+}
+.act:hover:not(:disabled) { color: var(--ink); border-color: var(--ink-low); }
+.act:disabled { opacity: .45; cursor: default; }
+
+.act-go {
+  color: var(--card); background: var(--ink);
+  border-color: var(--ink); padding: 7px 20px;
+}
+.act-go:hover:not(:disabled) { background: var(--stamp); border-color: var(--stamp); color: #fff; }
+
+/* ── Modes ────────────────────────────────────────────────── */
+.modes {
+  display: flex; gap: 26px;
+  padding: 0 26px;
+  border-bottom: 1px solid var(--rule);
+  background: var(--card);
+  position: sticky; top: 50px; z-index: 29;
+}
+.mode {
+  appearance: none; background: none; border: 0; padding: 13px 0 12px;
+  font: 400 13px/1 var(--sans); color: var(--ink-low);
+  border-bottom: 1px solid transparent; margin-bottom: -1px;
+  cursor: pointer; transition: color .12s;
+}
+.mode:hover { color: var(--ink-mid); }
+.mode.is-on { color: var(--ink); border-bottom-color: var(--stamp); }
+
+/* ── Page ─────────────────────────────────────────────────── */
+.view { display: none; max-width: 1060px; margin: 0 auto; padding: 30px 26px 90px; }
+.view.is-on { display: block; }
+
+/* ── Query ────────────────────────────────────────────────── */
+/* The query spans the full column. The gutter below it belongs to the apparatus,
+   which has nothing to annotate until an answer exists. */
+.query {
+  border: 1px solid var(--rule-sc);
+  border-radius: var(--radius);
+  background: var(--card);
+}
+.query:focus-within { border-color: var(--ink-low); }
+
+.query textarea {
+  display: block; width: 100%; resize: none; overflow: hidden;
+  padding: 15px 17px 13px; border: 0; background: none;
+  color: var(--ink); font: 17px/1.5 var(--serif);
+  min-height: 54px;
+}
+.query textarea:focus { outline: none; }
+.query textarea::placeholder { color: var(--ink-low); font-style: italic; }
+
+.query-bar {
+  display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+  padding: 8px 9px 8px 17px;
+  border-top: 1px solid var(--rule);
+}
+.knobs { display: flex; align-items: center; gap: 15px; flex-wrap: wrap; }
+.knobs label {
+  display: flex; align-items: center; gap: 5px;
+  font: 10.5px/1 var(--mono); color: var(--ink-low);
+  letter-spacing: .06em; text-transform: uppercase; white-space: nowrap;
+}
+.knobs select {
+  font: 11px/1 var(--mono); color: var(--ink);
+  padding: 3px 4px; background: var(--paper);
+  border: 1px solid var(--rule-sc); border-radius: var(--radius);
+}
+.knobs .flag { gap: 5px; cursor: pointer; }
+.knobs input[type=checkbox] { accent-color: var(--stamp); margin: 0; }
+.query-bar .act-go { margin-left: auto; }
+
+/* ── Extra options ────────────────────────────────────────── */
+.more { margin: 11px 0 0; }
+.more summary {
+  font: 10.5px/1 var(--mono); letter-spacing: .06em; text-transform: uppercase;
+  color: var(--ink-low); cursor: pointer; padding: 4px 0; width: fit-content;
+  list-style: none;
+}
+.more summary::-webkit-details-marker { display: none; }
+.more summary::before { content: "+ "; }
+.more[open] summary::before { content: "− "; }
+.more summary:hover { color: var(--ink-mid); }
+.more-grid {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  gap: 13px; padding: 11px 0 3px;
+}
+.more-grid label {
+  display: flex; flex-direction: column; gap: 5px;
+  font: 10.5px/1 var(--mono); letter-spacing: .06em;
+  text-transform: uppercase; color: var(--ink-low);
+}
+.more-grid input {
+  font: 12.5px/1.4 var(--sans); color: var(--ink); padding: 6px 8px;
+  background: var(--card); border: 1px solid var(--rule-sc); border-radius: var(--radius);
+}
+
+/* ── Reading layout: gutter + column ──────────────────────── */
+.reading {
+  display: grid;
+  grid-template-columns: var(--gutter) minmax(0, 1fr);
+  column-gap: var(--gap);
+  margin-top: 34px;
+}
+.apparatus { position: relative; grid-column: 1; }
+.prose { grid-column: 2; }
+.reading-foot { grid-column: 2; }
+
+@media (max-width: 860px) {
+  .reading { grid-template-columns: minmax(0, 1fr); }
+  .apparatus { grid-row: 2; margin-top: 26px; }
+  .prose { grid-row: 1; }
+  .reading-foot { grid-row: 3; }
+}
+
+/* ── The answer ───────────────────────────────────────────── */
+.prose {
+  font: 17px/1.78 var(--serif);
+  color: var(--ink);
+  white-space: pre-wrap; word-wrap: break-word;
+  max-width: 63ch;
+  min-height: 1.78em;
+}
+.prose:empty::after {
+  content: ""; display: inline-block;
+  width: 2px; height: 1.1em; background: var(--stamp);
+  animation: caret 1.05s step-end infinite; vertical-align: -.18em;
+}
+@keyframes caret { 50% { opacity: 0; } }
+
+/* Inline citation marks. Superior figures, as a printed edition would set them. */
+.cite {
+  font: 600 10.5px/1 var(--mono);
+  color: var(--stamp);
+  vertical-align: .42em;
+  padding: 0 1px 0 2px;
+  cursor: pointer;
+  border: 0; background: none;
+  transition: opacity .12s;
+}
+.cite::before { content: "["; opacity: .45; }
+.cite::after  { content: "]"; opacity: .45; }
+.cite:hover, .cite.lit { background: var(--stamp-w); }
+
+.reading-foot {
+  margin: 26px 0 0;
+  padding-top: 11px;
+  border-top: 1px solid var(--rule);
+  font: 10.5px/1.5 var(--mono); color: var(--ink-low);
+  letter-spacing: .05em; text-transform: uppercase;
+  max-width: 63ch;
+}
+
+/* ── Marginal notes ───────────────────────────────────────── */
+.note {
+  position: absolute; left: 0; width: 100%;
+  padding: 0 13px 0 0;
+  border-right: 1px solid var(--rule);
+  cursor: pointer;
+  transition: top .32s cubic-bezier(.22,.61,.36,1), border-color .15s;
+}
+.note.placed { border-right-color: var(--rule-sc); }
+.note.lit { border-right-color: var(--stamp); }
+
+@media (max-width: 860px) {
+  .note { position: static !important; width: auto; margin-bottom: 15px;
+          padding: 0 0 0 13px; border-right: 0; border-left: 1px solid var(--rule); }
+}
+
+.note-head {
+  display: flex; align-items: baseline; gap: 7px;
+  font: 10.5px/1.4 var(--mono); letter-spacing: .04em;
+  margin-bottom: 4px;
+}
+.note-n { color: var(--stamp); font-weight: 600; }
+.note-src { color: var(--ink-mid); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.note-pg  { color: var(--ink-low); white-space: nowrap; }
+.note-sc  { margin-left: auto; color: var(--ink-low); font-size: 9.5px; }
+
+.note-text {
+  font: 12.5px/1.62 var(--serif); color: var(--ink-mid);
+  display: -webkit-box; -webkit-line-clamp: 5; -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.note.open .note-text { -webkit-line-clamp: unset; }
+
+/* Retrieved but never cited — the honest part of a retrieval demo. */
+.note.unused { opacity: .52; }
+.note.unused .note-n { color: var(--ink-low); }
+.note.unused .note-n::after {
+  content: " không dùng"; font-size: 9px; letter-spacing: .05em;
+  text-transform: uppercase; color: var(--ink-low);
+}
+
+.apparatus-head {
+  font: 10.5px/1 var(--mono); letter-spacing: .08em; text-transform: uppercase;
+  color: var(--ink-low); padding-bottom: 9px; margin-bottom: 3px;
+  border-bottom: 1px solid var(--rule); text-align: right;
+}
+@media (max-width: 860px) { .apparatus-head { text-align: left; } }
+
+/* ── Invitation & feedback ────────────────────────────────── */
+.invite {
+  margin: 46px 0 0;
+  max-width: 54ch;
+  border-left: 1px solid var(--stamp);
+  padding-left: 17px;
+}
+.invite-lead { margin: 0 0 9px; font: 16px/1.6 var(--serif); color: var(--ink); }
+.invite-note { margin: 0; font: 12.5px/1.65 var(--sans); color: var(--ink-mid); }
+.invite code {
+  font: 11.5px var(--mono); padding: 1px 4px;
+  background: var(--card); border: 1px solid var(--rule);
+}
+
+.wait { display: flex; flex-direction: column; gap: 9px; }
+.wait i {
+  display: block; height: 9px; background: var(--rule);
+  animation: breathe 1.5s ease-in-out infinite;
+}
+.wait i:nth-child(2) { width: 76%; animation-delay: .16s; }
+.wait i:nth-child(3) { width: 88%; animation-delay: .32s; }
+@keyframes breathe { 50% { opacity: .38; } }
+
+/* ── Gallery ──────────────────────────────────────────────── */
+.gallery-state {
+  display: flex; align-items: center; gap: 14px;
+  margin: 0 0 16px;
+  font: 11px/1 var(--mono); color: var(--ink-mid); letter-spacing: .02em;
+}
+.gallery-state .act { margin-left: auto; }
+
+.tiles {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+  gap: 16px;
+  margin-top: 28px;
+}
+
+.tile {
+  margin: 0;
+  border: 1px solid var(--rule-sc);
+  border-radius: var(--radius);
+  background: var(--card);
+  overflow: hidden;
+}
+.tile img {
+  display: block; width: 100%; aspect-ratio: 4 / 3;
+  object-fit: cover; background: var(--paper);
+}
+.tile figcaption { padding: 10px 12px; }
+.tile-cap {
+  font: 12.5px/1.5 var(--serif); color: var(--ink-mid);
+  display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.tile-sc {
+  display: block; margin-top: 6px;
+  font: 10.5px/1 var(--mono); color: var(--ink-low);
+}
+
+.notice {
+  position: fixed; left: 26px; bottom: 24px; margin: 0;
+  padding: 10px 15px; max-width: min(460px, calc(100vw - 52px));
+  background: var(--ink); color: var(--paper);
+  border-left: 3px solid var(--stamp);
+  font: 12.5px/1.5 var(--sans); z-index: 60;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::after { animation: none !important; transition: none !important; }
+}
